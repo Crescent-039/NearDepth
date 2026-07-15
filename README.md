@@ -135,7 +135,32 @@ NearDepth is trained with complementary real and synthetic data. Each dataset se
 
 GraspNet sensor depth contains holes and local noise around reflective surfaces, occlusions, and thin structures. In the paper, dense Depth Pro predictions are aligned with valid sensor measurements and used as refined pseudo labels. This improves supervision density while the final model remains affine-invariant rather than metric-scale.
 
-The released dataset utilities currently provide GraspNet and DREDS loading, camera normalization, augmentation, evaluation preprocessing, padding, and pseudo-label diagnostics. Dataset files and generated pseudo labels are not redistributed.
+### Pseudo-label preparation with Depth Pro
+
+We provide two utilities under `tools/` for preparing and checking dense GraspNet supervision. They build on Apple's official [Depth Pro](https://github.com/apple/ml-depth-pro) implementation; install Depth Pro and download its pretrained checkpoint by following the instructions in that repository before running inference.
+
+1. `tools/infer_folder.py` performs batched Depth Pro inference over an image folder. Predictions are converted from meters to millimeters and saved as single-channel 16-bit PNG files.
+
+   ```bash
+   python tools/infer_folder.py \
+       --input_folder /path/to/realsense/rgb \
+       --output_folder /path/to/realsense/synthetic_depth \
+       --precision fp16
+   ```
+
+2. `tools/debug.py` pairs sensor depth with the generated `synthetic_depth` maps, checks file type, shape, invalid pixels, and depth statistics, and reports Raw, P1–P99, and P5–P95 metrics. With `--use_align`, it additionally estimates a per-image median scale factor and evaluates the scale-aligned predictions.
+
+   ```bash
+   python tools/debug.py \
+       --root_dir /path/to/graspnet_dataset \
+       --mode train \
+       --num 400 \
+       --use_align
+   ```
+
+`debug.py` reports the estimated alignment factors and post-alignment metrics; it does not overwrite the generated PNG files.
+
+The released dataset utilities provide GraspNet and DREDS loading, camera normalization, augmentation, evaluation preprocessing, padding, pseudo-label inference, and scale-alignment diagnostics. Dataset files and generated pseudo labels are not redistributed.
 
 ### Expected GraspNet layout
 
@@ -226,6 +251,9 @@ NearDepth/
 │   ├── NearDepth.py         # Main network
 │   ├── modules.py           # SDF, L-AdaBins, DySample, and decoder blocks
 │   └── Loss.py              # Affine-invariant training objectives
+├── tools/
+│   ├── infer_folder.py      # Depth Pro batch inference to uint16 PNG
+│   └── debug.py             # Pseudo-depth validation and scale-alignment diagnostics
 ├── dataset.py               # Dataset readers and augmentations
 ├── data_debug.py            # Sensor/pseudo-depth diagnostics
 ├── train.py                 # Joint training and validation
