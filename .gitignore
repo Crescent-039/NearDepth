@@ -1,0 +1,58 @@
+﻿.project
+
+# Visual Studion tiedostoja
+*/[Ee]xported[Oo]bj/
+*.booproj
+*.pidb
+*.suo
+*.svd
+*.user
+*.userprefs
+*.pth
+bin/
+obj/
+.vs/
+.agents/
+checkpoint/
+Compiled/
+Compiled*/
+pretrained_model/
+image_test/
+debug_vis/
+demo_data/
+demo_results/
+datasets/
+one_image_train_results/
+one_image_train_test/
+teacher_depthpro/
+test_images/
+test_results/
+weights/
+experiments/
+
+# Käyttiksen (Mac ja win) tekemiä tiedostoja joita jättää pois
+._*
+.DS_Store*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Icon?
+[Tt]humbs.db
+
+# Dolphin
+.directory
+.idea
+__pycache__
+*.py[cod]
+logs/
+.ipynb_checkpoints/
+venv/
+.env
+
+# run
+yolov11/run/
+checkpoints
+animatior_output
+
+# Local manuscript draft
+access.pdf
