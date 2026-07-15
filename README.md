@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🌄 NearDepth: Lightweight Close-Range Monocular Depth Estimation
+# NearDepth: Lightweight Close-Range Monocular Depth Estimation
 
 ### Semantic-Driven Feature Decoding and Lightweight Adaptive Binning
 
