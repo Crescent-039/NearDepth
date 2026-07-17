@@ -9,25 +9,26 @@ import numpy as np
 import torch
 import torch.optim as optim
 from PIL import Image
+import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, Dataset, DataLoader
 from torchvision import transforms
 
 # 引入你的模型和Loss
-from networks.NearDepth import NearDepth
-from networks.Loss import NearDepthLoss
+from networks.Aincrad_Net import AincradNet
+from networks.Loss import AincradLoss
 from utils import compute_metrics
-from dataset import GraspNetDepthDataset, DREDS_CatKnown_Dataset, depth_collate_pad
+from dataset import GraspNetDepthDataset, DREDS_CatKnown_Dataset, HypersimDepthDataset, PaperFigureDataset, depth_collate_pad
 
 from networks.Loss import solve_scale_shift, grad_mag, erode_valid_mask
 
 # 训练主流程
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train NearDepth with a configurable decoder for ablation studies')
+    parser = argparse.ArgumentParser(description='Train AincradNet with configurable neck for ablation study')
     parser.add_argument('--neck-type', type=str, default='sdf', choices=['sdf', 'dpt_custom', 'dpt_official'])
-    parser.add_argument('--epochs', type=int, default=11)
+    parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--exp-suffix', type=str, default='')
     return parser.parse_args()
 
@@ -44,40 +45,54 @@ def train(args=None):
     epochs = args.epochs
     neck_type = args.neck_type  # 可选: 'sdf' | 'dpt_custom' | 'dpt_official'
 
-    exp_name = f'NearDepth_{neck_type}'
+    exp_name = f'AincradNet_{neck_type}'
     if args.exp_suffix:
         exp_name = f'{exp_name}_{args.exp_suffix}'
     exp_root = os.path.join('experiments', exp_name)
     weights_dir = os.path.join(exp_root, 'weights')
     history_dir = os.path.join(exp_root, 'history')
     vis_dir = os.path.join(exp_root, 'visuals')
+    highres_vis_dir = os.path.join(exp_root, 'highres')
     os.makedirs(weights_dir, exist_ok=True)
     os.makedirs(history_dir, exist_ok=True)
     os.makedirs(vis_dir, exist_ok=True)
+    os.makedirs(highres_vis_dir, exist_ok=True)
 
     print(f"初始化模型 (Device: {device})...")
 
     # --- 初始化 ---
-    model = NearDepth(img_size, neck_type=neck_type)
-    criterion = NearDepthLoss(stage='coarse', min_depth=1e-3, max_depth=3).to(device)
+    model = AincradNet(img_size, neck_type=neck_type)
+    criterion = AincradLoss(stage='coarse', min_depth=1e-3, max_depth=200).to(device)
 
-    weights_path = "./weights/NearDepth.pth"
+    # 恢复权重
+    weights_path = "./weights/latest.pth"
+
+    start_epoch = 0 # 记录起始 epoch，默认为 0
 
     if os.path.exists(weights_path):
-        print("加载一阶段训练权重")
+        print(f"正在从 {weights_path} 加载一阶段训练权重...")
         checkpoint = torch.load(weights_path, map_location='cpu')
+        # 解析真正的 model state_dict
+        if isinstance(checkpoint, dict):
+            if 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            elif 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            else:
+                state_dict = checkpoint
+        else:
+            state_dict = checkpoint
+        # 加载模型参数
+        model.load_state_dict(state_dict, strict=True)
+        print("模型权重加载成功！")
     else:
         print(f"权重文件 {weights_path} 不存在，跳过加载")
-        checkpoint = None  # 或执行其他初始化操作
+        checkpoint = None
 
-    if isinstance(checkpoint, dict) and 'model_state_dict' not in checkpoint:
-    # strict=True 表示严格匹配每一层
-        model.load_state_dict(checkpoint, strict=True)
-        
     model = model.to(device)
 
     lr_backbone = 1e-5
-    lr_head = 5e-4
+    lr_head = 1e-5
     # 不训练骨干网络
     trainable_params =[
         {'params': model.backbone.blocks[-2:].parameters(), 'lr': lr_backbone},
@@ -90,31 +105,49 @@ def train(args=None):
     ]
     # 优化器和学习率调度器
     optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=4, min_lr=1e-5)
+     # 如果 checkpoint 存在且含有优化器状态，则恢复
+    if checkpoint is not None and isinstance(checkpoint, dict):
+        if 'optimizer' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                print("优化器状态恢复成功！")
+            except Exception as e:
+                print(f"优化器状态恢复失败（可能是因为改变了 trainable_params 结构），将使用初始优化器。提示: {e}")
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"将从 Epoch {start_epoch + 1} 继续训练。")
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=4, min_lr=1e-7)
 
     # ---------------- 实例化训练集与验证集 ----------------
-    Grasp_train_dataset = GraspNetDepthDataset('../autodl-tmp/graspnet_dataset', mode='train', target_size=img_size, sample_size=25600, overfit_one=False)
-    Grasp_val_dataset = GraspNetDepthDataset('../autodl-tmp/graspnet_dataset', mode='val', target_size=img_size, sample_size=1000)
+    Hypersim_train_dataset = HypersimDepthDataset('../autodl-tmp/Hypersim_dataset', mode='train', target_size=img_size, sample_size=35000, overfit_one=False)
+    Hypersim_val_dataset = HypersimDepthDataset('../autodl-tmp/Hypersim_dataset', mode='val', target_size=img_size, sample_size=500)
+    
+    Grasp_train_dataset = GraspNetDepthDataset('../autodl-tmp/graspnet_dataset', mode='train', target_size=img_size, sample_size=25000, overfit_one=False)
+    Grasp_val_dataset = GraspNetDepthDataset('../autodl-tmp/graspnet_dataset', mode='val', target_size=img_size, sample_size=500)
 
     # 将 D435 真实内参传给 DREDS，使其在加载时归一化到 D435 视角（消除焦距差异）
-    DREDS_train_dataset = DREDS_CatKnown_Dataset('../autodl-tmp/DREDS_CatKnown_Dataset', mode='train', target_size=img_size, sample_size=90000, overfit_one=False,
+    DREDS_train_dataset = DREDS_CatKnown_Dataset('../autodl-tmp/DREDS_CatKnown_Dataset', mode='train', target_size=img_size, sample_size=40000, overfit_one=False,
                                                   ref_fx=Grasp_train_dataset.ref_fx, ref_img_w=Grasp_train_dataset.ref_img_w)
-    DREDS_val_dataset = DREDS_CatKnown_Dataset('../autodl-tmp/DREDS_CatKnown_Dataset', mode='val', target_size=img_size, sample_size=1000,
+    DREDS_val_dataset = DREDS_CatKnown_Dataset('../autodl-tmp/DREDS_CatKnown_Dataset', mode='val', target_size=img_size, sample_size=500,
                                                 ref_fx=Grasp_val_dataset.ref_fx, ref_img_w=Grasp_val_dataset.ref_img_w)
+    
+    PaperFigure = PaperFigureDataset('../autodl-tmp/PaperFigureDataset', mode='train', target_size=img_size, sample_size=16, overfit_one=False)
+    
     # 合并数据集
-    combined_train_dataset = ConcatDataset([DREDS_train_dataset, Grasp_train_dataset])
+    combined_train_dataset = ConcatDataset([DREDS_train_dataset, Grasp_train_dataset, Hypersim_train_dataset])
     
     train_loader = DataLoader(combined_train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    # 两套验证集
+    # 三套验证集
     Grasp_val_loader = DataLoader(Grasp_val_dataset, batch_size=batch_size, shuffle=False)
     DREDS_val_loader = DataLoader(DREDS_val_dataset, batch_size=batch_size, shuffle=False)
+    Hypersim_val_loader = DataLoader(Hypersim_val_dataset, batch_size=batch_size, shuffle=False)
 
     best_rmse = float('inf')  # 记录验证集历史最佳 RMSE
     history = []
 
     start_time = time.time()
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         # 用训练集训练
         model.train()
         train_loss_total = 0.0
@@ -124,15 +157,14 @@ def train(args=None):
             rgb_global = rgb_global.to(device)
             depth_global = depth_global.to(device)
             content_mask = content_mask.to(device)
-
             # 清零梯度
             optimizer.zero_grad()
             # 第一轮全局图前向传播
             pred_depth_g, bin_edges_g = model(rgb_global)
-            if epoch == 10:
+            if epoch == 1:
                 criterion.set_stage('edge')
             # 直接在训练循环里内置mask传给loss，更灵活
-            valid_mask = ((depth_global > 1e-3) & (depth_global < 3) & (content_mask > 0.5))
+            valid_mask = ((depth_global > 1e-3) & (depth_global < 200) & (content_mask > 0.5))
             # 计算 Loss
             loss_g, loss_dict_g = criterion(pred_depth_g, bin_edges_g, depth_global, valid_mask)
             # 反向传播
@@ -170,23 +202,32 @@ def train(args=None):
         grasp_results = validate(model, Grasp_val_loader, device, criterion, "GraspNet")
         # 验证 DREDS
         dreds_results = validate(model, DREDS_val_loader, device, criterion, "DREDS")
+        # 验证 DREDS
+        Hypersim_results = validate(model, Hypersim_val_loader, device, criterion, "Hypersim")
         # 根据验证集loss来调整学习率而并非训练集loss，降低过拟合风险
-        avg_combined_val_loss = (grasp_results['loss'] + dreds_results['loss']) / 2
+        avg_combined_val_loss = (grasp_results['loss'] + dreds_results['loss'] + Hypersim_results['loss']) / 3
         scheduler.step(avg_combined_val_loss) # 这里建议优先看真实场景的 loss
 
         # ---------------- 打印报告与最佳模型保存 ----------------
         print(f"📊 [Epoch {epoch+1} Report]")
         print(f"  Train Loss: {avg_train_loss:.4f}")
 
-        avg_rmse = (grasp_results['rmse'] + dreds_results['rmse']) / 2
-        avg_rmse_aligned = (grasp_results['rmse_aligned'] + dreds_results['rmse_aligned']) / 2
+        avg_rmse = (grasp_results['rmse'] + dreds_results['rmse'] + Hypersim_results['rmse']) / 3
+        avg_rmse_aligned = (grasp_results['rmse_aligned'] + dreds_results['rmse_aligned'] + Hypersim_results['rmse_aligned']) / 3
         
         # 基于验证集 RMSE 保存最好的模型
         if avg_rmse_aligned < best_rmse:
             best_rmse = avg_rmse_aligned
-            print(f" 🏆 发现更优模型 (grasp RMSE: {grasp_results['rmse']:.4f})(dreds RMSE: {dreds_results['rmse']:.4f})，已保存 Best Checkpoint.")
-            print(f"(avg RMSE aligned: {best_rmse:.4f})(grasp RMSE aligned: {grasp_results['rmse_aligned']:.4f})(dreds RMSE aligned: {dreds_results['rmse_aligned']:.4f})，已保存 Best Checkpoint.")
-            torch.save(model.state_dict(), os.path.join(weights_dir, 'best.pth'))
+            print(f" 🏆 发现更优模型 (grasp RMSE: {grasp_results['rmse']:.4f})(dreds RMSE: {dreds_results['rmse']:.4f})(dreds RMSE: {Hypersim_results['rmse']:.4f})，已保存 Best Checkpoint.")
+            print(f"(avg RMSE aligned: {best_rmse:.4f})(grasp RMSE aligned: {grasp_results['rmse_aligned']:.4f})(dreds RMSE aligned: {dreds_results['rmse_aligned']:.4f})(dreds RMSE aligned: {Hypersim_results['rmse_aligned']:.4f})，已保存 Best Checkpoint.")
+
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+            }
+            
+            torch.save(checkpoint, os.path.join(weights_dir, 'best.pth'))
         
         current_head_lr = optimizer.param_groups[2]['lr']
         current_backbone_lr = optimizer.param_groups[0]['lr']
@@ -196,11 +237,14 @@ def train(args=None):
             'train_loss': float(avg_train_loss),
             'val_loss_grasp': float(grasp_results['loss']),
             'val_loss_dreds': float(dreds_results['loss']),
+            'val_loss_Hypersim': float(Hypersim_results['loss']),
             'val_loss_mean': float(avg_combined_val_loss),
             'rmse_grasp': float(grasp_results['rmse']),
             'rmse_dreds': float(dreds_results['rmse']),
+            'Hypersim_dreds': float(Hypersim_results['rmse']),
             'rmse_aligned_grasp': float(grasp_results['rmse_aligned']),
             'rmse_aligned_dreds': float(dreds_results['rmse_aligned']),
+            'rmse_aligned_Hypersim': float(Hypersim_results['rmse_aligned']),
             'rmse_aligned_mean': float(avg_rmse_aligned),
             'lr_head': float(current_head_lr),
             'lr_backbone': float(current_backbone_lr),
@@ -215,6 +259,22 @@ def train(args=None):
         if epoch % 1 == 0:
             # 简单的可视化保存
             save_visualization(rgb_global, depth_global, pred_depth_g, content_mask, epoch, vis_dir)
+            # 插值放大回原图尺寸
+            # 使用 bicubic (双三次插值) 比 bilinear 边缘更平滑，伪影更少
+            final_depth_resized = F.interpolate(
+                pred_depth_g.float(),           
+                size=(720, 1280),
+                mode='bicubic',
+                align_corners=False
+            )
+            # 转为 numpy (原图大小的物理深度值)
+            depth_array_final = final_depth_resized[0, 0].detach().cpu().numpy() 
+            # 直接保存一张最高清（与原图完全等分辨率）的彩色深度图
+            plt.imsave(
+                os.path.join(highres_vis_dir, f"{epoch}_depth_highres.png"), 
+                depth_array_final, 
+                cmap='Spectral'
+            )
             torch.save(model.state_dict(), os.path.join(weights_dir, 'latest.pth'))
 
     end_time = time.time()
@@ -242,13 +302,13 @@ def validate(model, val_loader, device, criterion, dataset_name="Dataset"):
             
             pred_depth_g, bin_edges_g = model(rgb_g)
             
-            valid_mask = ((depth_g > 1e-3) & (depth_g < 3) & (content_mask > 0.5))
+            valid_mask = ((depth_g > 1e-3) & (depth_g < 200) & (content_mask > 0.5))
             # 计算 Loss
             loss_v, _ = criterion(pred_depth_g, bin_edges_g, depth_g, valid_mask)
             val_loss_total += float(loss_v.item())
             
             # 计算指标
-            stats = compute_metrics(pred_depth_g, depth_g, min_depth=1e-3, max_depth=3, valid_mask=valid_mask)
+            stats = compute_metrics(pred_depth_g, depth_g, min_depth=1e-3, max_depth=200, valid_mask=valid_mask)
             if stats is None: continue
             
             metric_tot['n'] += int(stats['n'])
@@ -264,7 +324,7 @@ def validate(model, val_loader, device, criterion, dataset_name="Dataset"):
             pred_aligned = scale * pred_depth_g + shift
             pred_aligned = torch.clamp(pred_aligned, min=1e-4)
             # 用 pred_aligned 计算一套 AbsRel 和 RMSE，与原始指标对比
-            stats_aligned = compute_metrics(pred_aligned, depth_g, min_depth=1e-3, max_depth=3, valid_mask=valid_mask)
+            stats_aligned = compute_metrics(pred_aligned, depth_g, min_depth=1e-3, max_depth=200, valid_mask=valid_mask)
             
             metric_tot['abs_rel_sum_aligned'] += float(stats_aligned['abs_rel_sum'])
             metric_tot['sq_err_sum_aligned'] += float(stats_aligned['sq_err_sum'])
@@ -288,7 +348,7 @@ def validate(model, val_loader, device, criterion, dataset_name="Dataset"):
     return results
 
 
-def build_flat_region_mask(gt_depth, edge_threshold_q=0.75, min_depth=1e-3, max_depth=3.0):
+def build_flat_region_mask(gt_depth, edge_threshold_q=0.75, min_depth=1e-3, max_depth=200.0):
     """
     只选择深度梯度小（平坦区域）且有效的像素用于绝对尺度监督
     """

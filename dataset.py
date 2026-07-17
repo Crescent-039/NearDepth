@@ -5,6 +5,7 @@ import cv2
 import glob
 import torch
 import random
+import h5py
 import numpy as np
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
@@ -188,7 +189,7 @@ class GraspNetDepthDataset(Dataset):
                 
                 # 只取 realsense 文件夹
                 rs_rgb_dir = os.path.join(train_path, scene_folder, 'realsense', 'rgb')
-                rs_depth_dir = os.path.join(train_path, scene_folder, 'realsense', 'depth')    # 大模型推理出的尖锐边缘深度图depth
+                rs_depth_dir = os.path.join(train_path, scene_folder, 'realsense', 'synthetic_depth')    # 大模型推理出的尖锐边缘深度图synthetic_depth
                 
                 if not os.path.exists(rs_rgb_dir) or not os.path.exists(rs_depth_dir):
                     continue
@@ -290,6 +291,61 @@ class GraspNetDepthDataset(Dataset):
                 return_mask=True
             )
         return rgb_global, depth_global, content_mask
+
+
+# =======新的用来跑论文插图的数据集=========
+class PaperFigureDataset(GraspNetDepthDataset):
+    def __init__(self, my_data_path, **kwargs):
+        # 可以在这里设置一个虚拟 root_dir，只要里面的 intrinsics 文件存在就行
+        # 或者干脆在子类里不依赖 ref_fx 和 ref_img_w，那就可以在 super().__init__ 后置为 None
+        super().__init__(root_dir=my_data_path, **kwargs)
+        # 如果不需要 D435 内参，直接覆盖掉
+        self.ref_fx = None
+        self.ref_img_w = None
+
+    def _scan_dataset(self):
+        rgb_exts = {'.jpg', '.jpeg', '.png'}
+        depth_exts = {'.exr', '.png', '.tiff', '.tif'}  # 按需增删
+        def list_files_with_ext(dir_path, allowed_exts):
+            files = []
+            for p in glob.glob(os.path.join(dir_path, '*')):
+                if os.path.isfile(p):
+                    ext = os.path.splitext(p)[1].lower()
+                    if ext in allowed_exts:
+                        files.append(p)
+            return sorted(files)
+        def extract_prefix(file_path):
+            stem = os.path.splitext(os.path.basename(file_path))[0]
+            return stem.split('_')[0]
+        rgb_paths, depth_paths = [], []
+        # 扫描所有 scene_*
+        scene_dirs = []
+        for name in sorted(os.listdir(self.root_dir)):
+            if name.startswith('scene_'):
+                p = os.path.join(self.root_dir, name)
+                if os.path.isdir(p):
+                    scene_dirs.append(p)
+        for scene_dir in scene_dirs:
+            rgb_dir = os.path.join(scene_dir, 'rgb')
+            depth_dir = os.path.join(scene_dir, 'depth')
+            if not (os.path.isdir(rgb_dir) and os.path.isdir(depth_dir)):
+                continue
+            rgb_files = list_files_with_ext(rgb_dir, rgb_exts)
+            depth_files = list_files_with_ext(depth_dir, depth_exts)
+            # depth 建 prefix 索引
+            depth_map = {}
+            for dp in depth_files:
+                k = extract_prefix(dp)
+                if k not in depth_map:
+                    depth_map[k] = dp
+            # 用 rgb 去匹配同 prefix 的 depth
+            for rp in rgb_files:
+                k = extract_prefix(rp)
+                dp = depth_map.get(k)
+                if dp is not None:
+                    rgb_paths.append(rp)
+                    depth_paths.append(dp)
+        return rgb_paths, depth_paths
 
         
 class DREDS_CatKnown_Dataset(Dataset):
@@ -459,20 +515,185 @@ class DREDS_CatKnown_Dataset(Dataset):
         # ★ 正则相机归一化：将 D415 视角图像 resize 到 D435 视角
         #   - 深度值（米）不变，仅做空间缩放以对齐 FOV
         #   - 输出已裁剪/pad 到 (target_h, target_w)
+        '''
         rgb_img, depth_img, content_mask = canonical_resize_to_ref_camera(
             rgb_img, depth_img,
             src_fx=self.src_fx, src_img_w=orig_w,   # 用实际图像宽度，更准确
             ref_fx=self.ref_fx, ref_img_w=self.ref_img_w,
             target_h=self.target_h, target_w=self.target_w
         )
-        
+        '''
         if self.mode == 'train' and (not self.overfit_one):
+            base_mask = np.ones_like(depth_img, dtype=np.uint8)
             rgb_global, depth_global, content_mask = augment_train(
                 rgb_img, depth_img,
                 target_size=(self.target_h, self.target_w),
                 mean=self.mean, std=self.std,
                 min_depth=1e-3, max_depth=3,
                 multi_scales=None,  # 先设None，避免batch维度不一致
+                extra_mask=base_mask,
+                return_mask=True
+            )
+        else:
+            base_mask = np.ones_like(depth_img, dtype=np.uint8)
+            rgb_global, depth_global, content_mask = preprocess_eval(
+                rgb_img, depth_img,
+                target_size=(self.target_h, self.target_w),
+                mean=self.mean, std=self.std,
+                min_depth=1e-3, max_depth=3,
+                extra_mask=base_mask,
+                return_mask=True
+            )
+        return rgb_global, depth_global, content_mask
+        
+
+class HypersimDepthDataset(Dataset):
+    def __init__(self, root_dir, mode='train', target_size=(360, 640), max_missing_ratio=0.2,
+                 sample_size=None, overfit_one=False):
+        """
+        Hypersim RGB + HDF5 深度数据集预处理
+        :param root_dir: Hypersim_dataset 根目录
+        :param mode: 'train' 或 'val'，按 scene 级别做 9:1 划分
+        :param target_size: (H, W) 网络输入尺寸
+        :param max_missing_ratio: 允许的最大无效深度比例
+        :param sample_size: 随机抽样样本数，None 表示使用全部
+        """
+        self.root_dir = root_dir
+        self.mode = mode
+        self.target_h, self.target_w = target_size
+        self.max_missing_ratio = max_missing_ratio
+        self.overfit_one = overfit_one
+        self.skip_depth_filter = True
+
+        # DINOv2 标准归一化参数
+        self.mean = [0.485, 0.456, 0.406]
+        self.std = [0.229, 0.224, 0.225]
+
+        print(f"🔍 正在扫描 Hypersim 数据集目录 (模式: {self.mode.upper()})...")
+        all_rgb_paths, all_depth_paths = self._scan_dataset()
+        print(f"共为 {self.mode.upper()} 阶段分配了 {len(all_rgb_paths)} 组 RGB-Depth 数据对。")
+
+        print(f"🧹 正在依据空洞阈值 (>{max_missing_ratio*100}%) 过滤 Hypersim 深度图...")
+        self.valid_pairs = self._filter_bad_samples_multithreaded(all_rgb_paths, all_depth_paths)
+        print(f"✅ Hypersim 有效样本数: {len(self.valid_pairs)}")
+        if sample_size is not None:
+            if sample_size > len(self.valid_pairs):
+                print(f"⚠️ 警告：请求样本数大于总数，使用全部 {len(self.valid_pairs)} 张。")
+            else:
+                if self.overfit_one and sample_size == 1:
+                    self.valid_pairs = [self.valid_pairs[1800]]
+                    print("单张过拟合实验模式")
+                else:
+                    if self.mode == 'val':
+                        random.seed(42)
+                    self.valid_pairs = random.sample(self.valid_pairs, sample_size)
+                    random.seed()
+                    print(f"🎲 已抽取 {sample_size} 张图像。")
+
+    def _scan_dataset(self):
+        """按 scene 级别划分数据集，并在每个 scene 下收集所有 camera trajectory 的 RGB/Depth 配对。"""
+        all_scene_dirs = []
+        for scene_name in sorted(os.listdir(self.root_dir)):
+            scene_dir = os.path.join(self.root_dir, scene_name)
+            if os.path.isdir(scene_dir) and scene_name.startswith('ai_'):
+                all_scene_dirs.append(scene_dir)
+
+        split_idx = int(len(all_scene_dirs) * 0.99)
+        if self.mode == 'train':
+            assigned_scenes = all_scene_dirs[:split_idx]
+        else:
+            assigned_scenes = all_scene_dirs[split_idx:]
+
+        rgb_paths = []
+        depth_paths = []
+
+        for scene_dir in assigned_scenes:
+            images_dir = os.path.join(scene_dir, 'images')
+            if not os.path.isdir(images_dir):
+                continue
+
+            preview_dirs = sorted(glob.glob(os.path.join(images_dir, 'scene_cam_*_final_preview')))
+            for preview_dir in preview_dirs:
+                cam_name = os.path.basename(preview_dir).replace('_final_preview', '')
+                geometry_dir = os.path.join(images_dir, f'{cam_name}_geometry_hdf5')
+                if not os.path.isdir(geometry_dir):
+                    continue
+
+                rgb_files = sorted(glob.glob(os.path.join(preview_dir, 'frame.*.color.jpg')))
+                for rgb_p in rgb_files:
+                    frame_name = os.path.basename(rgb_p).replace('.color.jpg', '')
+                    depth_p = os.path.join(geometry_dir, f'{frame_name}.depth_meters.hdf5')
+                    if os.path.exists(depth_p):
+                        rgb_paths.append(rgb_p)
+                        depth_paths.append(depth_p)
+
+        return rgb_paths, depth_paths
+
+    def _read_hdf5_depth(self, depth_path):
+        with h5py.File(depth_path, 'r') as f:
+            if 'dataset' in f:
+                depth = f['dataset'][:]
+            else:
+                keys = list(f.keys())
+                if len(keys) == 0:
+                    raise ValueError(f"HDF5 文件中未找到数据集: {depth_path}")
+                depth = f[keys[0]][:]
+
+        depth = np.asarray(depth)
+        depth = np.squeeze(depth)
+        if depth.ndim != 2:
+            raise ValueError(f"深度图维度异常，期望二维数组，实际为 {depth.shape}: {depth_path}")
+        return depth.astype(np.float32)
+
+    def _check_single_depth(self, depth_path):
+        try:
+            depth = self._read_hdf5_depth(depth_path)
+            invalid_mask = np.isnan(depth) | np.isinf(depth) | (depth <= 0)
+            invalid_ratio = float(np.sum(invalid_mask)) / float(depth.size)
+            return invalid_ratio <= self.max_missing_ratio
+        except Exception:
+            return False
+
+    def _filter_bad_samples_multithreaded(self, rgb_paths, depth_paths):
+        if self.skip_depth_filter:
+            return list(zip(rgb_paths, depth_paths))
+        valid_pairs = []
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(self._check_single_depth, d) for d in depth_paths]
+            for i, future in enumerate(tqdm(futures, desc=f"{self.mode.upper()} Hypersim 过滤")):
+                if future.result():
+                    valid_pairs.append((rgb_paths[i], depth_paths[i]))
+        return valid_pairs
+
+    def __len__(self):
+        return len(self.valid_pairs)
+
+    def __getitem__(self, idx):
+        rgb_path, depth_path = self.valid_pairs[idx]
+
+        # 读取 RGB 预览图（OpenCV 默认 BGR，需转为 RGB）
+        rgb_img = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+        rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = rgb_img.shape[:2]
+
+        # 读取 Hypersim 深度图（单位：米）
+        depth_img = self._read_hdf5_depth(depth_path)
+        depth_h, depth_w = depth_img.shape[:2]
+        if (depth_h, depth_w) != (orig_h, orig_w):
+            depth_img = cv2.resize(depth_img, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+
+        # content_mask 表示真实有效监督区域
+        content_mask = np.isfinite(depth_img) & (depth_img > 1e-3) & (depth_img < 200)
+        content_mask = content_mask.astype(np.uint8)
+        depth_img = np.nan_to_num(depth_img, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+        if self.mode == 'train' and (not self.overfit_one):
+            rgb_global, depth_global, content_mask = augment_train(
+                rgb_img, depth_img,
+                target_size=(self.target_h, self.target_w),
+                mean=self.mean, std=self.std,
+                min_depth=1e-3, max_depth=200,
+                multi_scales=None,
                 extra_mask=content_mask,
                 return_mask=True
             )
@@ -481,12 +702,13 @@ class DREDS_CatKnown_Dataset(Dataset):
                 rgb_img, depth_img,
                 target_size=(self.target_h, self.target_w),
                 mean=self.mean, std=self.std,
-                min_depth=1e-3, max_depth=3,
+                min_depth=1e-3, max_depth=200,
                 extra_mask=content_mask,
                 return_mask=True
             )
+
         return rgb_global, depth_global, content_mask
-        
+
 
 # ==================工具函数=================
 
@@ -612,10 +834,10 @@ def augment_train(
     # 多分辨率（可选）
     multi_scales=None,   # e.g. [(352, 512), (384, 640), (448, 640)]
     # RGB外观增强
-    p_color=0.8,
-    p_gamma=0.3,
+    p_color=0.1,
+    p_gamma=0.1,
     gamma_range=(0.9, 1.1),
-    p_blur_noise_jpeg=0.4,
+    p_blur_noise_jpeg=0,
     p_cutout=0,
     extra_mask=None,
     return_mask=False
