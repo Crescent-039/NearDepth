@@ -14,23 +14,48 @@ from torch.utils.data import ConcatDataset, Dataset, DataLoader
 from torchvision import transforms
 
 # 引入你的模型和Loss
-from networks.Aincrad_Net import AincradNet
-from networks.Loss import AincradLoss
+from networks.NearDepth import NearDepth
+from networks.Loss import NearDepthLoss, gradient_weight_for_epoch
 from utils import compute_metrics
 from dataset import GraspNetDepthDataset, DREDS_CatKnown_Dataset, HypersimDepthDataset, PaperFigureDataset, depth_collate_pad
 
 from networks.Loss import solve_scale_shift, grad_mag, erode_valid_mask
+from depth_config import DEFAULT_RHO_MIN, validate_rho_min
 
 # 训练主流程
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train AincradNet with configurable neck for ablation study')
+    parser = argparse.ArgumentParser(description='Train NearDepth on normalized relative depth')
     parser.add_argument('--neck-type', type=str, default='sdf', choices=['sdf', 'dpt_custom', 'dpt_official'])
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--rho-min', type=float, default=DEFAULT_RHO_MIN)
+    parser.add_argument('--resume', type=str, default='')
     parser.add_argument('--exp-suffix', type=str, default='')
     return parser.parse_args()
+
+
+def build_optimizer_param_groups(model, backbone_lr=1e-5, decoder_lr=1e-4):
+    """Build the learning-rate groups specified by the NearDepth recipe."""
+    return [
+        {'name': 'dinov2_last_two_blocks', 'params': model.backbone.blocks[-2:].parameters(), 'lr': backbone_lr},
+        {'name': 'dinov2_final_norm', 'params': model.backbone.norm.parameters(), 'lr': backbone_lr},
+        {'name': 'sdf_decoder', 'params': model.neck.parameters(), 'lr': decoder_lr},
+        {'name': 'l_adabins', 'params': model.AdaBins.parameters(), 'lr': decoder_lr},
+        {'name': 'rgb_stem_h2', 'params': model.stem_h2.parameters(), 'lr': decoder_lr},
+        {'name': 'rgb_stem_h4', 'params': model.stem_h4.parameters(), 'lr': decoder_lr},
+        {'name': 'rgb_feature_fusion', 'params': model.feature_fusion.parameters(), 'lr': decoder_lr},
+    ]
+
+
+def build_metric_depth_masks(depth_m, valid_mask):
+    """Near/Mid/Far masks defined strictly in raw metric GT space."""
+    valid = valid_mask.bool() & torch.isfinite(depth_m) & (depth_m > 0.0)
+    return {
+        'near': valid & (depth_m >= 0.1) & (depth_m < 0.8),
+        'mid': valid & (depth_m >= 0.8) & (depth_m < 1.5),
+        'far': valid & (depth_m >= 1.5),
+    }
 
 
 def train(args=None):
@@ -41,11 +66,11 @@ def train(args=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     img_size = (360, 640)
     batch_size = args.batch_size  # 显存小的改 1
-    lr = args.lr
     epochs = args.epochs
+    rho_min = validate_rho_min(args.rho_min)
     neck_type = args.neck_type  # 可选: 'sdf' | 'dpt_custom' | 'dpt_official'
 
-    exp_name = f'AincradNet_{neck_type}'
+    exp_name = f'NearDepth_{neck_type}'
     if args.exp_suffix:
         exp_name = f'{exp_name}_{args.exp_suffix}'
     exp_root = os.path.join('experiments', exp_name)
@@ -61,17 +86,30 @@ def train(args=None):
     print(f"初始化模型 (Device: {device})...")
 
     # --- 初始化 ---
-    model = AincradNet(img_size, neck_type=neck_type)
-    criterion = AincradLoss(stage='coarse', min_depth=1e-3, max_depth=200).to(device)
+    model = NearDepth(img_size, neck_type=neck_type, rho_min=rho_min)
+    criterion = NearDepthLoss(rho_min=rho_min).to(device)
 
     # 恢复权重
-    weights_path = "./weights/latest.pth"
+    weights_path = args.resume
 
     start_epoch = 0 # 记录起始 epoch，默认为 0
 
-    if os.path.exists(weights_path):
+    if weights_path and not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Resume checkpoint not found: {weights_path}")
+
+    if weights_path:
         print(f"正在从 {weights_path} 加载一阶段训练权重...")
         checkpoint = torch.load(weights_path, map_location='cpu')
+        if not isinstance(checkpoint, dict) or checkpoint.get('depth_space') != 'normalized_relative_depth':
+            raise ValueError(
+                'Refusing to load a checkpoint without depth_space=normalized_relative_depth; '
+                'legacy metric/disparity weights are incompatible.'
+            )
+        checkpoint_rho_min = float(checkpoint.get('rho_min', -1.0))
+        if abs(checkpoint_rho_min - rho_min) > 1e-12:
+            raise ValueError(
+                f'Checkpoint rho_min={checkpoint_rho_min} does not match configured rho_min={rho_min}.'
+            )
         # 解析真正的 model state_dict
         if isinstance(checkpoint, dict):
             if 'model' in checkpoint:
@@ -91,20 +129,10 @@ def train(args=None):
 
     model = model.to(device)
 
-    lr_backbone = 1e-5
-    lr_head = 1e-5
     # 不训练骨干网络
-    trainable_params =[
-        {'params': model.backbone.blocks[-2:].parameters(), 'lr': lr_backbone},
-        {'params': model.backbone.norm.parameters(), 'lr': lr_backbone},
-        {'params': model.neck.parameters(), 'lr': lr_head},
-        {'params': model.AdaBins.parameters(), 'lr': lr_head},
-        {'params': model.stem_h2.parameters(), 'lr': lr_head},
-        {'params': model.stem_h4.parameters(), 'lr': lr_head},
-        {'params': model.feature_fusion.parameters(), 'lr': lr_head}
-    ]
+    trainable_params = build_optimizer_param_groups(model)
     # 优化器和学习率调度器
-    optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
+    optimizer = optim.AdamW(trainable_params, weight_decay=0.01)
      # 如果 checkpoint 存在且含有优化器状态，则恢复
     if checkpoint is not None and isinstance(checkpoint, dict):
         if 'optimizer' in checkpoint:
@@ -119,17 +147,19 @@ def train(args=None):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=4, min_lr=1e-7)
 
     # ---------------- 实例化训练集与验证集 ----------------
-    Hypersim_train_dataset = HypersimDepthDataset('../autodl-tmp/Hypersim_dataset', mode='train', target_size=img_size, sample_size=35000, overfit_one=False)
-    Hypersim_val_dataset = HypersimDepthDataset('../autodl-tmp/Hypersim_dataset', mode='val', target_size=img_size, sample_size=500)
+    Hypersim_train_dataset = HypersimDepthDataset('../autodl-tmp/Hypersim_dataset', mode='train', target_size=img_size, sample_size=35000, overfit_one=False, rho_min=rho_min, return_metric_depth=True)
+    Hypersim_val_dataset = HypersimDepthDataset('../autodl-tmp/Hypersim_dataset', mode='val', target_size=img_size, sample_size=500, rho_min=rho_min, return_metric_depth=True)
     
-    Grasp_train_dataset = GraspNetDepthDataset('../autodl-tmp/graspnet_dataset', mode='train', target_size=img_size, sample_size=25000, overfit_one=False)
-    Grasp_val_dataset = GraspNetDepthDataset('../autodl-tmp/graspnet_dataset', mode='val', target_size=img_size, sample_size=500)
+    Grasp_train_dataset = GraspNetDepthDataset('../autodl-tmp/graspnet_dataset', mode='train', target_size=img_size, sample_size=25000, overfit_one=False, rho_min=rho_min, return_metric_depth=True)
+    Grasp_val_dataset = GraspNetDepthDataset('../autodl-tmp/graspnet_dataset', mode='val', target_size=img_size, sample_size=500, rho_min=rho_min, return_metric_depth=True)
 
     # 将 D435 真实内参传给 DREDS，使其在加载时归一化到 D435 视角（消除焦距差异）
     DREDS_train_dataset = DREDS_CatKnown_Dataset('../autodl-tmp/DREDS_CatKnown_Dataset', mode='train', target_size=img_size, sample_size=40000, overfit_one=False,
-                                                  ref_fx=Grasp_train_dataset.ref_fx, ref_img_w=Grasp_train_dataset.ref_img_w)
+                                                  ref_fx=Grasp_train_dataset.ref_fx, ref_img_w=Grasp_train_dataset.ref_img_w,
+                                                  rho_min=rho_min, return_metric_depth=True)
     DREDS_val_dataset = DREDS_CatKnown_Dataset('../autodl-tmp/DREDS_CatKnown_Dataset', mode='val', target_size=img_size, sample_size=500,
-                                                ref_fx=Grasp_val_dataset.ref_fx, ref_img_w=Grasp_val_dataset.ref_img_w)
+                                                ref_fx=Grasp_val_dataset.ref_fx, ref_img_w=Grasp_val_dataset.ref_img_w,
+                                                rho_min=rho_min, return_metric_depth=True)
     
     PaperFigure = PaperFigureDataset('../autodl-tmp/PaperFigureDataset', mode='train', target_size=img_size, sample_size=16, overfit_one=False)
     
@@ -148,11 +178,12 @@ def train(args=None):
     start_time = time.time()
 
     for epoch in range(start_epoch, epochs):
+        criterion.set_epoch(epoch)
         # 用训练集训练
         model.train()
         train_loss_total = 0.0
         print(f"Epoch {epoch + 1} 开始训练...")
-        for i, (rgb_global, depth_global, content_mask) in enumerate(train_loader):
+        for i, (rgb_global, depth_global, depth_metric_global, content_mask) in enumerate(train_loader):
             # 全局和局部的图
             rgb_global = rgb_global.to(device)
             depth_global = depth_global.to(device)
@@ -161,10 +192,11 @@ def train(args=None):
             optimizer.zero_grad()
             # 第一轮全局图前向传播
             pred_depth_g, bin_edges_g = model(rgb_global)
-            if epoch == 1:
-                criterion.set_stage('edge')
             # 直接在训练循环里内置mask传给loss，更灵活
-            valid_mask = ((depth_global > 1e-3) & (depth_global < 200) & (content_mask > 0.5))
+            valid_mask = (
+                (depth_global >= rho_min) & (depth_global <= 1.0)
+                & torch.isfinite(depth_global) & (content_mask > 0.5)
+            )
             # 计算 Loss
             loss_g, loss_dict_g = criterion(pred_depth_g, bin_edges_g, depth_global, valid_mask)
             # 反向传播
@@ -225,6 +257,8 @@ def train(args=None):
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
+                'depth_space': 'normalized_relative_depth',
+                'rho_min': rho_min,
             }
             
             torch.save(checkpoint, os.path.join(weights_dir, 'best.pth'))
@@ -253,8 +287,11 @@ def train(args=None):
         save_loss_curves(history, history_dir, exp_name)
 
         print(f"Epoch [{epoch + 1}/{epochs}] val_Loss: {avg_combined_val_loss:.4f} | train_Loss: {avg_train_loss:.4f}")
-        print(f"SILog_g: {loss_dict_g['silog']:.4f} | MAE_g: {loss_dict_g['MAE']:.4f} | Edge_g: {loss_dict_g['edge']:.4f} | low_g: {loss_dict_g['low']:.4f} \
- | nonedge_g: {loss_dict_g['nonedge']:.4f} | ssi_g: {loss_dict_g['ssi']:.4f} | gm_g: {loss_dict_g['gm']:.4f} | Current Head LR: {current_head_lr:.6f} | Current Backbone LR: {current_backbone_lr:.6f}")
+        print(
+            f"SSI_g: {loss_dict_g['ssi']:.4f} | GM_g: {loss_dict_g['gm']:.4f} | "
+            f"lambda_grad: {loss_dict_g['lambda_grad']:.1f} | "
+            f"Current Head LR: {current_head_lr:.6f} | Current Backbone LR: {current_backbone_lr:.6f}"
+        )
 
         if epoch % 1 == 0:
             # 简单的可视化保存
@@ -275,76 +312,110 @@ def train(args=None):
                 depth_array_final, 
                 cmap='Spectral'
             )
-            torch.save(model.state_dict(), os.path.join(weights_dir, 'latest.pth'))
+            torch.save({
+                'model': model.state_dict(),
+                'epoch': epoch,
+                'depth_space': 'normalized_relative_depth',
+                'rho_min': rho_min,
+            }, os.path.join(weights_dir, 'latest.pth'))
 
     end_time = time.time()
     total_seconds = end_time - start_time
     print("✅ 训练测试完成！")
     print(f"总耗时: {total_seconds}")
     
-    torch.save(model.state_dict(), os.path.join(weights_dir, 'final.pth'))
-
-
+    torch.save({
+        'model': model.state_dict(),
+        'epoch': epochs - 1,
+        'depth_space': 'normalized_relative_depth',
+        'rho_min': rho_min,
+    }, os.path.join(weights_dir, 'final.pth'))
 # 验证函数
 def validate(model, val_loader, device, criterion, dataset_name="Dataset"):
+    """Evaluate relative predictions after affine alignment to raw metric GT."""
     model.eval()
     val_loss_total = 0.0
     metric_tot = {
         'n': 0, 'abs_rel_sum': 0.0, 'sq_err_sum': 0.0,
-        'd1_sum': 0.0, 'd2_sum': 0.0, 'd3_sum': 0.0, 'abs_rel_sum_aligned': 0.0, 'sq_err_sum_aligned': 0.0
+        'd1_sum': 0.0, 'd2_sum': 0.0, 'd3_sum': 0.0,
     }
-    
+    interval_tot = {
+        name: {'n': 0, 'abs_rel_sum': 0.0}
+        for name in ('near', 'mid', 'far')
+    }
+
     with torch.no_grad():
-        for (rgb_global, depth_global, content_mask) in val_loader:
+        for rgb_global, relative_gt, depth_m, content_mask in val_loader:
             rgb_g = rgb_global.to(device)
-            depth_g = depth_global.to(device)
-            content_mask = content_mask.to(device)
-            
-            pred_depth_g, bin_edges_g = model(rgb_g)
-            
-            valid_mask = ((depth_g > 1e-3) & (depth_g < 200) & (content_mask > 0.5))
-            # 计算 Loss
-            loss_v, _ = criterion(pred_depth_g, bin_edges_g, depth_g, valid_mask)
+            relative_gt = relative_gt.to(device)
+            depth_m = depth_m.to(device)
+            valid_mask = content_mask.to(device).bool()
+
+            pred_relative, bin_edges = model(rgb_g)
+            relative_valid = (
+                valid_mask & torch.isfinite(relative_gt) & (relative_gt > 0.0)
+            )
+            loss_v, _ = criterion(
+                pred_relative, bin_edges, relative_gt, relative_valid
+            )
             val_loss_total += float(loss_v.item())
-            
-            # 计算指标
-            stats = compute_metrics(pred_depth_g, depth_g, min_depth=1e-3, max_depth=200, valid_mask=valid_mask)
-            if stats is None: continue
-            
-            metric_tot['n'] += int(stats['n'])
-            metric_tot['abs_rel_sum'] += float(stats['abs_rel_sum'])
-            metric_tot['sq_err_sum'] += float(stats['sq_err_sum'])
-            metric_tot['d1_sum'] += float(stats['d1_sum'])
-            metric_tot['d2_sum'] += float(stats['d2_sum'])
-            metric_tot['d3_sum'] += float(stats['d3_sum'])
 
-            # ========debug==========
-            mask = valid_mask
-            scale, shift = solve_scale_shift(pred_depth_g, depth_g, mask)
-            pred_aligned = scale * pred_depth_g + shift
-            pred_aligned = torch.clamp(pred_aligned, min=1e-4)
-            # 用 pred_aligned 计算一套 AbsRel 和 RMSE，与原始指标对比
-            stats_aligned = compute_metrics(pred_aligned, depth_g, min_depth=1e-3, max_depth=200, valid_mask=valid_mask)
-            
-            metric_tot['abs_rel_sum_aligned'] += float(stats_aligned['abs_rel_sum'])
-            metric_tot['sq_err_sum_aligned'] += float(stats_aligned['sq_err_sum'])
+            metric_valid = (
+                valid_mask & torch.isfinite(depth_m) & (depth_m > 0.0)
+            )
+            scale, shift = solve_scale_shift(
+                pred_relative, depth_m, metric_valid.float()
+            )
+            pred_metric = scale * pred_relative + shift
+            pred_metric = torch.clamp(pred_metric, min=1e-6)
 
-    # 计算平均指标
+            stats = compute_metrics(
+                pred_metric, depth_m, min_depth=1e-6, max_depth=200.0,
+                valid_mask=metric_valid,
+            )
+            if stats is None:
+                continue
+            for key in metric_tot:
+                source = 'n' if key == 'n' else key
+                metric_tot[key] += stats[source]
+
+            for name, interval_mask in build_metric_depth_masks(
+                depth_m, metric_valid
+            ).items():
+                interval_stats = compute_metrics(
+                    pred_metric, depth_m, min_depth=1e-6, max_depth=200.0,
+                    valid_mask=interval_mask,
+                )
+                if interval_stats is not None:
+                    interval_tot[name]['n'] += interval_stats['n']
+                    interval_tot[name]['abs_rel_sum'] += interval_stats['abs_rel_sum']
+
     n = max(metric_tot['n'], 1)
     results = {
         'loss': val_loss_total / max(len(val_loader), 1),
         'abs_rel': metric_tot['abs_rel_sum'] / n,
         'rmse': (metric_tot['sq_err_sum'] / n) ** 0.5,
-        'abs_rel_aligned': metric_tot['abs_rel_sum_aligned'] / n,
-        'rmse_aligned': (metric_tot['sq_err_sum_aligned'] / n) ** 0.5,
         'd1': metric_tot['d1_sum'] / n,
         'd2': metric_tot['d2_sum'] / n,
         'd3': metric_tot['d3_sum'] / n,
     }
-    
-    print(f" {dataset_name} -> Loss: {results['loss']:.4f} | AbsRel: {results['abs_rel']:.4f} | RMSE: {results['rmse']:.4f}")
-    print(f" {dataset_name} -> AbsRel_aligned: {results['abs_rel_aligned']:.4f} | RMSE_aligned: {results['rmse_aligned']:.4f}")
-    print(f" δ1: {results['d1']*100:.2f}% | δ2: {results['d2']*100:.2f}% | δ3: {results['d3']*100:.2f}%")
+    # Compatibility keys now refer to the same required metric-aligned result.
+    results['abs_rel_aligned'] = results['abs_rel']
+    results['rmse_aligned'] = results['rmse']
+    for name, totals in interval_tot.items():
+        results[f'abs_rel_{name}'] = (
+            totals['abs_rel_sum'] / totals['n']
+            if totals['n'] > 0 else float('nan')
+        )
+
+    print(
+        f" {dataset_name} -> metric-aligned AbsRel: {results['abs_rel']:.4f} | "
+        f"RMSE: {results['rmse']:.4f} | delta1: {results['d1'] * 100:.2f}%"
+    )
+    print(
+        f" {dataset_name} ranges -> Near: {results['abs_rel_near']:.4f} | "
+        f"Mid: {results['abs_rel_mid']:.4f} | Far: {results['abs_rel_far']:.4f}"
+    )
     return results
 
 

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from depth_config import DEFAULT_RHO_MIN
 
 
 # -------------------- 基础工具 --------------------
@@ -336,7 +337,9 @@ class GradientMatchingLoss(nn.Module):
 
 
 class DAv2ScaleShiftInvariantLoss(nn.Module):
-    def __init__(self, min_depth=0.1, max_depth=3.0, eps=1e-6, trim=0.1):
+    """Scale-and-shift invariant loss in normalized relative-depth space."""
+
+    def __init__(self, min_depth=1e-3, max_depth=1.0, eps=1e-6, trim=0.1):
         super().__init__()
         self.min_depth = min_depth
         self.max_depth = max_depth
@@ -351,17 +354,14 @@ class DAv2ScaleShiftInvariantLoss(nn.Module):
         finite = torch.isfinite(pred) & torch.isfinite(target)
         mask = mask * finite.float()
 
-        pred_inv = 1.0 / torch.clamp(pred, min=self.min_depth, max=self.max_depth)
-        target_inv = 1.0 / torch.clamp(target, min=self.min_depth, max=self.max_depth)
+        scale, shift = solve_scale_shift(pred, target, mask, eps=self.eps)
+        pred_aligned = scale * pred + shift
 
-        scale, shift = solve_scale_shift(pred_inv, target_inv, mask, eps=self.eps)
-        pred_aligned = scale * pred_inv + shift
-
-        residual = pred_aligned - target_inv
+        residual = pred_aligned - target
         loss = masked_trimmed_mean(residual.abs(), mask, trim=self.trim, eps=self.eps)
 
         if return_aligned:
-            return loss, pred_aligned, target_inv, mask
+            return loss, pred_aligned, target, mask
         return loss
 
 
@@ -380,8 +380,8 @@ class DAv2GradientMatchingLoss(nn.Module):
 
         return safe_masked_mean(dx.abs(), mx, eps=self.eps) + safe_masked_mean(dy.abs(), my, eps=self.eps)
 
-    def forward(self, pred_aligned_inv, target_inv, mask):
-        residual = pred_aligned_inv - target_inv
+    def forward(self, pred_aligned, target, mask):
+        residual = pred_aligned - target
         total = zero_loss_like(residual)
         used = 0
 
@@ -406,14 +406,14 @@ class DAv2GradientMatchingLoss(nn.Module):
 
 
 # -------------------- 新的总损失 --------------------
-class NearDepthLoss(nn.Module):
+class _LegacyAincradLoss(nn.Module):
     """
     两阶段推荐：
     stage='coarse': 先学几何，不强推边缘
     stage='edge':   再学边界，仍然约束非边界平滑
     """
     def __init__(self, stage='coarse',
-                 min_depth=1e-3, max_depth=10.0):
+                 min_depth=1e-3, max_depth=50.0):
         super().__init__()
 
         self.stage = stage
@@ -448,24 +448,24 @@ class NearDepthLoss(nn.Module):
     def set_stage(self, stage='coarse'):
         self.stage = stage
         if stage == 'coarse':
-            self.w_l1 = 0.0
-            self.w_silog = 0.0
+            self.w_l1 = 1.0
+            self.w_silog = 1.0
             self.w_low = 0.0
             self.w_nonedge = 0.0
-            self.w_edge = 0.0
+            self.w_edge = 3.5
             self.w_chamfer = 0.0
 
-            self.w_ssi = 1.0
+            self.w_ssi = 0.0
             self.w_gm = 2.0
         elif stage == 'edge':
-            self.w_l1 = 0.0
-            self.w_silog = 0.0
+            self.w_l1 = 1.0
+            self.w_silog = 1.0
             self.w_low = 0.0
             self.w_nonedge = 0.0
-            self.w_edge = 0.0
-            self.w_chamfer = 0.0
+            self.w_edge = 3.5
+            self.w_chamfer = 0.4
             
-            self.w_ssi = 1.0
+            self.w_ssi = 0.0
             self.w_gm = 2.0
         else:
             raise ValueError("stage must be 'coarse' or 'edge'")
@@ -526,6 +526,70 @@ class NearDepthLoss(nn.Module):
             "gm": float(l_gm.detach()),
             "total": float(total.detach())
         }
+
+
+def gradient_weight_for_epoch(epoch):
+    """Return lambda_g for a zero-based epoch index."""
+    return 0.2 if epoch < 2 else 2.0
+
+
+class NearDepthLoss(nn.Module):
+    """SSI + multi-scale residual-gradient loss on relative depth."""
+
+    def __init__(self, rho_min=DEFAULT_RHO_MIN, lambda_grad=0.2, eps=1e-6,
+                 trim=0.1, gm_scales=(1, 2, 4, 8)):
+        super().__init__()
+        if not 0.0 < rho_min < 1.0:
+            raise ValueError(f"rho_min must be in (0, 1), got {rho_min}")
+        self.rho_min = float(rho_min)
+        self.eps = eps
+        self.lambda_grad = float(lambda_grad)
+        self.loss_ssi = DAv2ScaleShiftInvariantLoss(
+            min_depth=self.rho_min,
+            max_depth=1.0,
+            eps=eps,
+            trim=trim,
+        )
+        self.loss_gm = DAv2GradientMatchingLoss(
+            scales=gm_scales, eps=eps
+        )
+
+    def set_epoch(self, epoch):
+        self.lambda_grad = gradient_weight_for_epoch(epoch)
+
+    def set_stage(self, stage='coarse'):
+        """Compatibility shim for callers using the old stage vocabulary."""
+        if stage == 'coarse':
+            self.lambda_grad = 0.2
+        elif stage == 'edge':
+            self.lambda_grad = 2.0
+        else:
+            raise ValueError("stage must be 'coarse' or 'edge'")
+
+    def forward(self, pred_depth, bin_edges, gt_depth, valid_mask=None):
+        del bin_edges
+        if valid_mask is None:
+            valid_mask = gt_depth > 0.0
+        valid_mask = valid_mask.float()
+        finite = torch.isfinite(pred_depth) & torch.isfinite(gt_depth)
+        valid_mask = valid_mask * finite.float()
+
+        l_ssi, pred_aligned, target, loss_mask = self.loss_ssi(
+            pred_depth, gt_depth, valid_mask, return_aligned=True
+        )
+        l_gm = self.loss_gm(pred_aligned, target, loss_mask)
+        total = l_ssi + self.lambda_grad * l_gm
+
+        return total, {
+            "ssi": float(l_ssi.detach()),
+            "gm": float(l_gm.detach()),
+            "lambda_grad": self.lambda_grad,
+            "total": float(total.detach()),
+        }
+
+
+# Backward-compatible import only. New code must use ``NearDepthLoss``.
+AincradLoss = NearDepthLoss
         
 
 

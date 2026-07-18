@@ -5,13 +5,42 @@ import cv2
 import glob
 import torch
 import random
-import h5py
 import numpy as np
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
+from depth_config import DEFAULT_RHO_MIN, DEPTH_NORMALIZATION_EPS, validate_rho_min
+
+
+def normalize_metric_depth(depth_m, valid_mask, rho_min=DEFAULT_RHO_MIN,
+                           eps=DEPTH_NORMALIZATION_EPS):
+    """Normalize one metric-depth map after spatial augmentation.
+
+    Valid pixels map to ``[rho_min, 1]``; zero is reserved for invalid pixels.
+    A nearly constant valid map is assigned the interval midpoint, which is a
+    stable finite target and does not invent a depth ordering.
+    """
+    rho_min = validate_rho_min(rho_min)
+    depth_m = np.asarray(depth_m, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(depth_m)
+    relative = np.zeros_like(depth_m, dtype=np.float32)
+    if not np.any(valid):
+        return relative
+
+    valid_depth = depth_m[valid]
+    d_min = float(valid_depth.min())
+    d_max = float(valid_depth.max())
+    depth_range = d_max - d_min
+    if depth_range < eps:
+        relative[valid] = 0.5 * (rho_min + 1.0)
+    else:
+        relative[valid] = rho_min + (1.0 - rho_min) * (
+            (valid_depth - d_min) / (depth_range + eps)
+        )
+        relative[valid] = np.clip(relative[valid], rho_min, 1.0)
+    return relative
 
 
 # ==================相机内参归一化工具==================
@@ -115,7 +144,8 @@ def canonical_resize_to_ref_camera(rgb_img, depth_img,
 
 
 class GraspNetDepthDataset(Dataset):
-    def __init__(self, root_dir, mode='train', target_size=(360, 640), max_missing_ratio=0.2, sample_size=2560, overfit_one=False):
+    def __init__(self, root_dir, mode='train', target_size=(360, 640), max_missing_ratio=0.2, sample_size=2560, overfit_one=False,
+                 rho_min=DEFAULT_RHO_MIN, return_metric_depth=False):
         """
         GraspNet-1B 单目深度估计专用数据集
         :param root_dir: graspnet_dataset 的根目录
@@ -129,6 +159,8 @@ class GraspNetDepthDataset(Dataset):
         self.max_missing_ratio = max_missing_ratio
 
         self.overfit_one = overfit_one
+        self.rho_min = validate_rho_min(rho_min)
+        self.return_metric_depth = return_metric_depth
         
         # DINOv2 标准归一化参数
         self.mean =[0.485, 0.456, 0.406]
@@ -271,26 +303,30 @@ class GraspNetDepthDataset(Dataset):
         
         if self.mode == 'train' and (not self.overfit_one):
             base_mask = np.ones_like(depth_img, dtype=np.uint8)
-            rgb_global, depth_global, content_mask = augment_train(
+            sample = augment_train(
                 rgb_img, depth_img,
                 target_size=(self.target_h, self.target_w),
                 mean=self.mean, std=self.std,
                 min_depth=1e-3, max_depth=3,
                 multi_scales=None,  # 先设None，避免batch维度不一致
                 extra_mask=base_mask,
-                return_mask=True
+                return_mask=True,
+                return_metric_depth=self.return_metric_depth,
+                rho_min=self.rho_min,
             )
         else:
             base_mask = np.ones_like(depth_img, dtype=np.uint8)
-            rgb_global, depth_global, content_mask = preprocess_eval(
+            sample = preprocess_eval(
                 rgb_img, depth_img,
                 target_size=(self.target_h, self.target_w),
                 mean=self.mean, std=self.std,
                 min_depth=1e-3, max_depth=3,
                 extra_mask=base_mask,
-                return_mask=True
+                return_mask=True,
+                return_metric_depth=self.return_metric_depth,
+                rho_min=self.rho_min,
             )
-        return rgb_global, depth_global, content_mask
+        return sample
 
 
 # =======新的用来跑论文插图的数据集=========
@@ -351,7 +387,8 @@ class PaperFigureDataset(GraspNetDepthDataset):
 class DREDS_CatKnown_Dataset(Dataset):
     def __init__(self, root_dir, mode='train', target_size=(360, 640), max_missing_ratio=0.2, sample_size=None,
                  overfit_one=False, exr_backend='openexr', debug_exr=False,
-                 ref_fx=None, ref_img_w=None):
+                 ref_fx=None, ref_img_w=None, rho_min=DEFAULT_RHO_MIN,
+                 return_metric_depth=False):
         """
         DREDS-CatKnown 模拟数据集预处理
         :param root_dir: DREDS 数据集的根目录 (包含 train_part0 ~ train_part4)
@@ -366,6 +403,8 @@ class DREDS_CatKnown_Dataset(Dataset):
         self.max_missing_ratio = max_missing_ratio
 
         self.overfit_one = overfit_one
+        self.rho_min = validate_rho_min(rho_min)
+        self.return_metric_depth = return_metric_depth
         
         # DINOv2 归一化参数
         self.mean =[0.485, 0.456, 0.406]
@@ -502,11 +541,16 @@ class DREDS_CatKnown_Dataset(Dataset):
             depth_img = depth_img[:, :, 0]
             
         # 清洗浮点脏数据：将 NaN 和 Inf 转为 0.0 (后续 Loss 计算时通过 valid_mask > 0 过滤)
+        base_mask = np.isfinite(depth_img) & (depth_img > 1e-3) & (depth_img < 3.0)
         depth_img = np.nan_to_num(depth_img, nan=0.0, posinf=0.0, neginf=0.0)
         # 把深度图对齐到 rgb 分辨率
         depth_h, depth_w = depth_img.shape[:2]
         if (depth_h, depth_w) != (orig_h, orig_w):
             depth_img = cv2.resize(depth_img, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+            base_mask = cv2.resize(
+                base_mask.astype(np.uint8), (orig_w, orig_h),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
         
         # DREDS 深度单位为"米(Meters)"，无需转换。
         # 如果发现尺度差 1000 倍（毫米），取消注释：
@@ -524,32 +568,35 @@ class DREDS_CatKnown_Dataset(Dataset):
         )
         '''
         if self.mode == 'train' and (not self.overfit_one):
-            base_mask = np.ones_like(depth_img, dtype=np.uint8)
-            rgb_global, depth_global, content_mask = augment_train(
+            sample = augment_train(
                 rgb_img, depth_img,
                 target_size=(self.target_h, self.target_w),
                 mean=self.mean, std=self.std,
                 min_depth=1e-3, max_depth=3,
                 multi_scales=None,  # 先设None，避免batch维度不一致
                 extra_mask=base_mask,
-                return_mask=True
+                return_mask=True,
+                return_metric_depth=self.return_metric_depth,
+                rho_min=self.rho_min,
             )
         else:
-            base_mask = np.ones_like(depth_img, dtype=np.uint8)
-            rgb_global, depth_global, content_mask = preprocess_eval(
+            sample = preprocess_eval(
                 rgb_img, depth_img,
                 target_size=(self.target_h, self.target_w),
                 mean=self.mean, std=self.std,
                 min_depth=1e-3, max_depth=3,
                 extra_mask=base_mask,
-                return_mask=True
+                return_mask=True,
+                return_metric_depth=self.return_metric_depth,
+                rho_min=self.rho_min,
             )
-        return rgb_global, depth_global, content_mask
+        return sample
         
 
 class HypersimDepthDataset(Dataset):
     def __init__(self, root_dir, mode='train', target_size=(360, 640), max_missing_ratio=0.2,
-                 sample_size=None, overfit_one=False):
+                 sample_size=None, overfit_one=False, rho_min=DEFAULT_RHO_MIN,
+                 return_metric_depth=False):
         """
         Hypersim RGB + HDF5 深度数据集预处理
         :param root_dir: Hypersim_dataset 根目录
@@ -563,6 +610,8 @@ class HypersimDepthDataset(Dataset):
         self.target_h, self.target_w = target_size
         self.max_missing_ratio = max_missing_ratio
         self.overfit_one = overfit_one
+        self.rho_min = validate_rho_min(rho_min)
+        self.return_metric_depth = return_metric_depth
         self.skip_depth_filter = True
 
         # DINOv2 标准归一化参数
@@ -630,6 +679,8 @@ class HypersimDepthDataset(Dataset):
         return rgb_paths, depth_paths
 
     def _read_hdf5_depth(self, depth_path):
+        import h5py
+
         with h5py.File(depth_path, 'r') as f:
             if 'dataset' in f:
                 depth = f['dataset'][:]
@@ -688,26 +739,30 @@ class HypersimDepthDataset(Dataset):
         depth_img = np.nan_to_num(depth_img, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
         if self.mode == 'train' and (not self.overfit_one):
-            rgb_global, depth_global, content_mask = augment_train(
+            sample = augment_train(
                 rgb_img, depth_img,
                 target_size=(self.target_h, self.target_w),
                 mean=self.mean, std=self.std,
                 min_depth=1e-3, max_depth=200,
                 multi_scales=None,
                 extra_mask=content_mask,
-                return_mask=True
+                return_mask=True,
+                return_metric_depth=self.return_metric_depth,
+                rho_min=self.rho_min,
             )
         else:
-            rgb_global, depth_global, content_mask = preprocess_eval(
+            sample = preprocess_eval(
                 rgb_img, depth_img,
                 target_size=(self.target_h, self.target_w),
                 mean=self.mean, std=self.std,
                 min_depth=1e-3, max_depth=200,
                 extra_mask=content_mask,
-                return_mask=True
+                return_mask=True,
+                return_metric_depth=self.return_metric_depth,
+                rho_min=self.rho_min,
             )
 
-        return rgb_global, depth_global, content_mask
+        return sample
 
 
 # ==================工具函数=================
@@ -840,7 +895,10 @@ def augment_train(
     p_blur_noise_jpeg=0,
     p_cutout=0,
     extra_mask=None,
-    return_mask=False
+    return_mask=False,
+    return_metric_depth=False,
+    rho_min=DEFAULT_RHO_MIN,
+    normalization_eps=DEPTH_NORMALIZATION_EPS,
 ):
     """
     rgb_img: uint8 RGB, [H,W,3]
@@ -912,11 +970,19 @@ def augment_train(
     rgb_t = TF.to_tensor(rgb)  # [3,H,W], 0~1
     rgb_t = TF.normalize(rgb_t, mean=mean, std=std)
     depth[~valid_mask] = 0.0
-    depth_t = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0)  # [1,H,W]
+    relative_depth = normalize_metric_depth(
+        depth, valid_mask, rho_min=rho_min, eps=normalization_eps
+    )
+    relative_depth_t = torch.from_numpy(relative_depth).unsqueeze(0)
+    metric_depth_t = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0)
     mask_t = torch.from_numpy(valid_mask.astype(np.float32)).unsqueeze(0)  # [1,H,W]
+    if return_mask and return_metric_depth:
+        return rgb_t, relative_depth_t, metric_depth_t, mask_t
     if return_mask:
-        return rgb_t, depth_t, mask_t
-    return rgb_t, depth_t
+        return rgb_t, relative_depth_t, mask_t
+    if return_metric_depth:
+        return rgb_t, relative_depth_t, metric_depth_t
+    return rgb_t, relative_depth_t
 # ----------------------------
 # 验证/测试预处理（不要增强）
 # ----------------------------
@@ -927,7 +993,10 @@ def preprocess_eval(
     std=(0.229, 0.224, 0.225),
     min_depth=1e-3, max_depth=3,
     extra_mask=None,
-    return_mask=False
+    return_mask=False,
+    return_metric_depth=False,
+    rho_min=DEFAULT_RHO_MIN,
+    normalization_eps=DEPTH_NORMALIZATION_EPS,
 ):
     rgb = cv2.resize(rgb_img, (target_size[1], target_size[0]), interpolation=cv2.INTER_LINEAR)
     depth = cv2.resize(depth_img, (target_size[1], target_size[0]), interpolation=cv2.INTER_NEAREST)
@@ -938,11 +1007,19 @@ def preprocess_eval(
     depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     depth[~valid_mask] = 0.0
     rgb_t = TF.normalize(TF.to_tensor(rgb), mean=mean, std=std)
-    depth_t = torch.from_numpy(depth).unsqueeze(0).float()
+    relative_depth = normalize_metric_depth(
+        depth, valid_mask, rho_min=rho_min, eps=normalization_eps
+    )
+    relative_depth_t = torch.from_numpy(relative_depth).unsqueeze(0).float()
+    metric_depth_t = torch.from_numpy(depth).unsqueeze(0).float()
     mask_t = torch.from_numpy(valid_mask.astype(np.float32)).unsqueeze(0)
+    if return_mask and return_metric_depth:
+        return rgb_t, relative_depth_t, metric_depth_t, mask_t
     if return_mask:
-        return rgb_t, depth_t, mask_t
-    return rgb_t, depth_t
+        return rgb_t, relative_depth_t, mask_t
+    if return_metric_depth:
+        return rgb_t, relative_depth_t, metric_depth_t
+    return rgb_t, relative_depth_t
 
 
 
@@ -955,17 +1032,29 @@ def depth_collate_pad(batch, pad_value_rgb=0.0, pad_value_depth=0.0, pad_value_m
     depth: [1,H,W]
     mask:  [1,H,W] (optional)
     """
-    rgbs, depths = [], []
+    rgbs, depths, metric_depths = [], [], []
+    has_metric = len(batch[0]) == 4
     max_h = max(item[0].shape[-2] for item in batch)
     max_w = max(item[0].shape[-1] for item in batch)
-    for rgb, depth in batch:
+    for item in batch:
+        if len(item) == 4:
+            rgb, depth, metric_depth, source_mask = item
+        elif len(item) == 3:
+            rgb, depth, source_mask = item
+            metric_depth = None
+        else:
+            rgb, depth = item
+            metric_depth = None
+            source_mask = torch.ones_like(depth, dtype=torch.bool)
         h, w = rgb.shape[-2], rgb.shape[-1]
         pad_h, pad_w = max_h - h, max_w - w
         # pad format: (left, right, top, bottom)
         pad = (0, pad_w, 0, pad_h)
         rgbs.append(F.pad(rgb, pad, value=pad_value_rgb))
         depths.append(F.pad(depth, pad, value=pad_value_depth))
-        m = torch.ones((1, h, w), dtype=torch.bool)   # 原图区域=1
+        if metric_depth is not None:
+            metric_depths.append(F.pad(metric_depth, pad, value=pad_value_depth))
+        m = source_mask.bool()
         m = F.pad(m, pad, value=0)                    # pad区域=0
         # 收集 mask
         if 'masks' not in locals():
@@ -976,12 +1065,6 @@ def depth_collate_pad(batch, pad_value_rgb=0.0, pad_value_depth=0.0, pad_value_m
     depths = torch.stack(depths, dim=0)
     masks = torch.stack(masks, dim=0)
     
+    if has_metric:
+        return rgbs, depths, torch.stack(metric_depths, dim=0), masks
     return rgbs, depths, masks
-
-
-
-
-    
-
-
-        

@@ -3,8 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-from ablation_study.DPT_blocks import FeatureFusionBlock_custom, _make_scratch
-from ablation_study.vit import ProjectReadout
+try:
+    from ablation_study.DPT_blocks import FeatureFusionBlock_custom, _make_scratch
+except ModuleNotFoundError:
+    FeatureFusionBlock_custom = None
+    _make_scratch = None
+try:
+    from ablation_study.vit import ProjectReadout
+except ModuleNotFoundError:
+    ProjectReadout = None
 
 # ================SDF模块组==start===============
 
@@ -122,11 +129,13 @@ class DPTNeckOfficialLike(nn.Module):
 
     设计目标：
     1. 尽量复用官方 DPT 的 reassemble / scratch / refinenet 范式；
-    2. 保留当前 NearDepth 的 DINOv2 backbone，不改主干，只替换 SDF neck；
+    2. 保留当前 AincradNet 的 DINOv2 backbone，不改主干，只替换 SDF neck；
     3. 输出仍保持为 [B, 256, H/4, W/4]，便于直接接入现有 AdaBins head。
     """
     def __init__(self, in_channels_list, out_channels=256, use_bn=False):
         super().__init__()
+        if _make_scratch is None or ProjectReadout is None:
+            raise ImportError("dpt_official requires the optional 'timm' dependency")
         if len(in_channels_list) != 4:
             raise ValueError(f"DPTNeckOfficialLike expects 4 feature levels, got {len(in_channels_list)}")
 
@@ -269,12 +278,23 @@ class DPTNeckOfficialLike(nn.Module):
 
 # ================AdaBins模块组==start================
 class LiteAdaBinsHead(nn.Module):
-    def __init__(self, in_channels=256, n_bins=100, min_val=0.1, max_val=10, norm='linear', feat_h2_channels=32, h2_alpha_max=0.15):
+    """Adaptive bins whose public output is normalized relative depth.
+
+    Bins are learned in the internal coordinate ``u = 1 / rho``. Their
+    centers are converted back to ``rho`` before the pixel-wise expectation.
+    """
+
+    def __init__(self, in_channels=256, n_bins=100, min_val=1e-3, max_val=1.0, norm='linear', feat_h2_channels=32, h2_alpha_max=0.15):
         super(LiteAdaBinsHead, self).__init__()
 
         self.n_bins = n_bins
         self.min_val = min_val
         self.max_val = max_val
+        if not 0.0 < self.min_val < self.max_val <= 1.0:
+            raise ValueError(
+                "relative-depth bounds must satisfy 0 < min_val < max_val <= 1, "
+                f"got [{self.min_val}, {self.max_val}]"
+            )
         # 极简全局 Bins 生成器
         # 输入: DINOv2 CLS Token (384维), 输出: n_bins 个宽度
         self.bin_mlp = nn.Sequential(
@@ -357,8 +377,10 @@ class LiteAdaBinsHead(nn.Module):
         
         # 将逆空间中心点转回物理深度中心点
         # 现中心点在近处非常密集，在远处非常稀疏
-        centers = 1.0 / inv_centers 
-        centers = centers.view(-1, self.n_bins, 1, 1) #[B, n_bins, 1, 1]
+        relative_centers = (1.0 / inv_centers).clamp(
+            min=self.min_val, max=self.max_val
+        )
+        centers = relative_centers.view(-1, self.n_bins, 1, 1) #[B, n_bins, 1, 1]
         # 生成像素概率映射 (Pixel-wise Probability)    H/4版本的暂且保留，可做输出
         pixel_logits_h4 = self.pixel_classifier(x) # [B, n_bins, H/4, W/4]
         pixel_probs_h4 = F.softmax(pixel_logits_h4.float(), dim=1).to(x.dtype)
@@ -396,11 +418,14 @@ class LiteAdaBinsHead(nn.Module):
         # 概率加权求和，得到最终高分辨率深度图[B, 1, H, W]
         # 此时得到的深度图，边缘将保持着特征图级别的极高锐利度
         pred_depth_h = torch.sum(pixel_probs_h * centers, dim=1, keepdim=True)
+        pred_depth_h = pred_depth_h.clamp(min=self.min_val, max=self.max_val)
         # 为了 Loss 计算的一致性，bin_edges 建议也转回物理深度返回
         # 但由于 cumsum 是在逆空间做的，转回后顺序会反过来，这里通常返回真实深度的 edges
-        metric_bin_edges = 1.0 / torch.flip(inv_bin_edges, dims=[1])
-        
-        return metric_bin_edges, pred_depth_h
+        relative_bin_edges = (1.0 / torch.flip(inv_bin_edges, dims=[1])).clamp(
+            min=self.min_val, max=self.max_val
+        )
+
+        return relative_bin_edges, pred_depth_h
 
 
 # ================AdaBins模块组==end================
