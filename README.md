@@ -266,17 +266,6 @@ NearDepth/
 └── utils.py                 # Resize and evaluation utilities
 ```
 
-## Citation
-
-If you find NearDepth useful in your research, please cite:
-
-```bibtex
-@article{shen2026neardepth,
-  title   = {NearDepth: Semantic-Driven Feature Decoding and Lightweight Adaptive Binning for Close-Range Monocular Depth Estimation},
-  author  = {Shen, Wenzhong and Sun, Liangze and Li, Junxian},
-  year    = {2026}
-}
-```
 
 ## License
 
