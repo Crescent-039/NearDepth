@@ -1,0 +1,87 @@
+{
+  "experiment_name": "paper_448_full",
+  "input_height": 448,
+  "input_width": 448,
+  "datasets": [
+    {
+      "name": "graspnet",
+      "train_manifest": "graspnet_train.jsonl",
+      "val_manifest": "graspnet_val.jsonl",
+      "sampling_weight": 1.0,
+      "eval_min_depth": 0.001,
+      "eval_max_depth": 3.0
+    },
+    {
+      "name": "dreds",
+      "train_manifest": "dreds_train.jsonl",
+      "val_manifest": "dreds_val.jsonl",
+      "sampling_weight": 1.0,
+      "eval_min_depth": 0.001,
+      "eval_max_depth": 3.0
+    },
+    {
+      "name": "hypersim",
+      "train_manifest": "hypersim_train.jsonl",
+      "val_manifest": "hypersim_val.jsonl",
+      "sampling_weight": 1.0,
+      "eval_min_depth": 0.001,
+      "eval_max_depth": 80.0
+    }
+  ],
+  "model": {
+    "backbone": "dinov2_vits14_reg",
+    "decoder": "sdf",
+    "head": "adabins",
+    "feature_dim": 256,
+    "n_bins": 100,
+    "rho_min": 0.001,
+    "common_init_seed": 42,
+    "decoder_init_seed": 42,
+    "use_rgb_guidance": false,
+    "sdf": {
+      "use_cls_modulation": true,
+      "use_semantic_gate": true,
+      "enhancement": "dual_branch",
+      "upsampling": "dysample",
+      "grid_alignment": "h16",
+      "modulation_init": "original"
+    }
+  },
+  "optimization": {
+    "epochs": 30,
+    "batch_size": 4,
+    "backbone_lr": 0.00001,
+    "decoder_lr": 0.0001,
+    "weight_decay": 0.01,
+    "num_workers": 4,
+    "precision": "fp32",
+    "accumulation_steps": 4,
+    "grad_clip_norm": 1.0,
+    "max_train_batches": null
+  },
+  "sampling": {
+    "mode": "dataset_balanced",
+    "epoch_samples": 49152
+  },
+  "loss": {
+    "protocol": "positive_affine_anchor_v2",
+    "anchor_weight": 1.0,
+    "trim": 0.1
+  },
+  "evaluation": {
+    "alignment": "positive_scale_shift",
+    "min_depth": 0.001,
+    "max_depth": 3.0,
+    "report_macro": true,
+    "report_micro": true,
+    "save_per_image": true
+  },
+  "runtime": {
+    "seed": 42,
+    "deterministic": true,
+    "output_dir": "experiments_v2",
+    "data_root": null,
+    "require_cuda": true,
+    "log_every": 128
+  }
+}

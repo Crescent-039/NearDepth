@@ -56,3 +56,8 @@ animatior_output
 
 # Local manuscript draft
 access.pdf
+
+# Reproduction outputs
+experiments_v2/
+/manifests/
+.codex/

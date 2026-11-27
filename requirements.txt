@@ -1,0 +1,10 @@
+# Install torch/torchvision using the CUDA-compatible official wheel index first.
+# Contract-tested locally: Python3.10, torch2.4.1+cu121, torchvision0.19.1+cu121.
+torch==2.4.1
+torchvision==0.19.1
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+h5py>=3.10,<4
+omegaconf>=2.3,<3
+timm>=1.0,<1.1
+Pillow>=10,<12
