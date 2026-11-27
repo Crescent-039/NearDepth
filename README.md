@@ -4,15 +4,37 @@
 
 NearDepth estimates relative depth in close-range scenes. Its Semantic-Driven Feature Decoder (SDF) uses the CLS token to modulate detail channels and the deepest feature map to gate detail at each spatial location. Multi-receptive-field enhancement and dynamic upsampling combine context and detail on compact grids. The main experiments compare SDF and Simple Fusion with the same DINOv2 ViT-S/14 backbone and AdaBins-style prediction-head design.
 
-![NearDepth architecture](assets/framework.png)
+## Architecture
+
+![NearDepth overview from Figure 1 of the JEI manuscript](assets/near-depth-framework.png)
+
+![SDF detail routing and spatial enhancement from Figure 3 of the JEI manuscript](assets/sdf-decoder.png)
 
 ## Results
 
-Across five paired training seeds, SDF reduced mean aligned image-macro AbsRel by **4.9% on GraspNet Novel** and **3.3% on DREDS CatNovel** relative to Simple. At 448 × 448 on an RTX 3060 (FP32, batch size 1), mean full-model latency was 24.888 ms for SDF and 24.048 ms for Simple.
+### Accuracy across five training seeds
 
-In the paper's separate multi-resolution benchmark with a common DINOv2 ViT-S/14 backbone, SDF had lower full-model latency than the tested DPT implementation at all three evaluated resolutions on RTX 5090 and RTX 3060.
+Paper Table 8 reports aligned image-macro AbsRel (mean ± sample standard deviation). Positive paired differences favor SDF.
 
-[Decoder diagram](assets/SDF.png) · [Qualitative comparison](assets/main_visual.png)
+| Test set | Simple ↓ | SDF ↓ | Simple − SDF [paired 95% CI] |
+| --- | ---: | ---: | ---: |
+| GraspNet Novel | 0.05940 ± 0.00046 | **0.05648 ± 0.00018** | 0.00292 [0.00243, 0.00341] |
+| DREDS CatNovel | 0.05387 ± 0.00029 | **0.05207 ± 0.00025** | 0.00179 [0.00145, 0.00214] |
+| NYUv2 (all 1,449) | 0.10018 ± 0.00037 | 0.09879 ± 0.00100 | 0.00139 [−0.00026, 0.00305] |
+
+SDF improved AbsRel in all five pairs on both close-range datasets. The mean reductions were **4.9% on GraspNet Novel** and **3.3% on DREDS CatNovel**. At 448 × 448 on an RTX 3060 (FP32, batch size 1), this comparison has a 0.840 ms mean full-model latency cost (24.888 ms for SDF and 24.048 ms for Simple, paper Table 9).
+
+### Full-model latency versus DPT
+
+Paper Tables 5 and 6 compare the tested DPT implementation and SDF with a common DINOv2 ViT-S/14 backbone. Values are mean full-model latency in milliseconds over 1,000 CUDA-event measurements (FP32, batch size 1).
+
+| Input (width × height) | RTX 5090 DPT | RTX 5090 SDF | RTX 3060 DPT | RTX 3060 SDF |
+| --- | ---: | ---: | ---: | ---: |
+| 320 × 180 | 7.31 | **5.99** | 18.56 | **14.38** |
+| 640 × 360 | 13.21 | **10.71** | 65.51 | **52.34** |
+| 1280 × 720 | 47.94 | **40.89** | 355.64 | **315.24** |
+
+[Qualitative comparison](assets/main_visual.png)
 
 ## Setup
 
