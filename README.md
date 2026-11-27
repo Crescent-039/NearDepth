@@ -2,6 +2,8 @@
 
 **Semantic-Driven Feature Decoding for Efficient Close-Range Monocular Depth Estimation**
 
+![Close-range RGB scenes paired with NearDepth predictions from Figure 2 of the JEI manuscript](assets/close-range-examples.png)
+
 NearDepth estimates relative depth in close-range scenes. Its Semantic-Driven Feature Decoder (SDF) uses the CLS token to modulate detail channels and the deepest feature map to gate detail at each spatial location. Multi-receptive-field enhancement and dynamic upsampling combine context and detail on compact grids. The main experiments compare SDF and Simple Fusion with the same DINOv2 ViT-S/14 backbone and AdaBins-style prediction-head design.
 
 ## Architecture
